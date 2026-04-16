@@ -671,7 +671,210 @@ sum = a + incr;                   // incorrect
 
 ---
 
-## 20. AXI-Stream Handshake `[LOWRISC]`
+## 20. Clock Domain Crossing `[BASE]`
+
+**MUST** synchronize all signals that cross clock domains. Unsynchronized crossings cause metastability and data corruption.
+
+### Two-flop synchronizer
+
+**MUST** use at minimum a two-flop synchronizer for single-bit control signals crossing domains:
+
+```verilog
+// correct — two-flop synchronizer
+reg [1:0] req_sync = 2'b00;
+always @(posedge clk_dst) begin
+    req_sync <= {req_sync[0], req_src};
+    if (rst) req_sync <= 2'b00;
+end
+wire req_dst = req_sync[1];
+```
+
+### Multi-bit bus crossing
+
+**MUST NOT** use two-flop synchronizers for multi-bit buses — bits may arrive in different clock cycles.
+
+- Use an **asynchronous FIFO** for data buses
+- Use a **handshake (req/ack) with gray-code pointer** for status buses
+- Use a **MUX-controlled register** for slow-changing configuration (hold stable during capture)
+
+### Naming convention
+
+| Suffix | Meaning |
+|--------|---------|
+| `_sync` | Output of a synchronizer (e.g., `req_sync`) |
+| `_src` | Signal in the source domain |
+| `_dst` | Signal in the destination domain |
+
+### Prohibitions
+
+- **MUST NOT** cross domains with combinational logic (e.g., `assign y_dst = a_src & b_src`)
+- **MUST NOT** use `always @(posedge clk_a or posedge clk_b)` — no dual-edge blocks
+- **SHOULD** document every domain crossing with a comment: `// CDC: clk_a -> clk_b`
+
+---
+
+## 21. Pipeline Register Insertion `[BASE]`
+
+### When to insert pipeline stages
+
+- **MUST** place pipeline registers at module I/O boundaries to cut inter-module timing paths
+- **SHOULD** insert a pipeline stage when combinational path depth exceeds 2 levels of logic
+- **SHOULD** register FSM output decode when next-state logic has deep combinational depth
+
+### Naming convention
+
+| Suffix | Meaning |
+|--------|---------|
+| `_pipe_reg` | Pipeline stage register |
+| `_pipe_next` | Pipeline stage next-state (if applicable) |
+
+### Pattern
+
+```verilog
+// Pipeline register at output boundary
+reg [DATA_WIDTH-1:0] result_pipe_reg = {DATA_WIDTH{1'b0}};
+always @(posedge clk) begin
+    result_pipe_reg <= result_comb;
+    if (rst) result_pipe_reg <= {DATA_WIDTH{1'b0}};
+end
+assign result_o = result_pipe_reg;
+```
+
+---
+
+## 22. Finite State Machine Encoding Selection `[BASE]`
+
+Section 14 defines FSM structure. This section specifies encoding selection.
+
+### Encoding choice
+
+| Encoding | Use case | Characteristics |
+|----------|----------|----------------|
+| **One-hot** | FPGA designs | 1 flip-flop per state; fast decode; higher area for many states |
+| **Binary** | ASIC designs or >16 states | Compact; slower decode due to wide fan-in |
+| **Gray-code** | State crossing clock domains | Only 1 bit changes per transition; pairs with CDC rules |
+| **Johnson** | Mod-N counters | Simple sequencing; 2 bit changes per transition |
+
+### Selection rules
+
+- **SHOULD** default to one-hot for FPGA targets
+- **SHOULD** use binary for ASIC targets or when state count > 16
+- **MUST** use Gray-code when the state register crosses a clock domain
+- **MUST** document encoding choice in the `localparam` block comment
+
+```verilog
+// One-hot encoding (FPGA default)
+localparam [3:0]
+    STATE_IDLE  = 4'b0001,  // one-hot
+    STATE_FETCH = 4'b0010,
+    STATE_EXEC  = 4'b0100,
+    STATE_DONE  = 4'b1000;
+
+// Gray-code encoding (cross-domain FSM)
+localparam [1:0]
+    STATE_IDLE  = 2'b00,    // gray
+    STATE_RUN   = 2'b01,
+    STATE_WAIT  = 2'b11,    // only 1 bit changed from RUN
+    STATE_DONE  = 2'b10;    // only 1 bit changed from WAIT
+```
+
+---
+
+## 23. Resource Utilization `[BASE]`
+
+### RAM inference
+
+**MUST** infer block RAM using the memory array pattern from section 17. Do not use distributed registers for memories deeper than 16 entries.
+
+- Single-port RAM: 1 read + 1 write (shared address)
+- Simple dual-port RAM: 1 read port + 1 write port (separate addresses)
+- True dual-port RAM: 2 read/write ports (if supported by target)
+
+```verilog
+// Simple dual-port RAM inference
+(* ramstyle = "no_rw_check" *)
+reg [DATA_WIDTH-1:0] mem [(2**ADDR_WIDTH)-1:0];
+
+always @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+end
+
+always @(posedge clk) begin
+    rd_data <= mem[rd_addr];
+end
+```
+
+### Clock gating
+
+**MUST NOT** use gated clocks (`clk_gated = clk & enable`). Use clock-enable pattern instead:
+
+```verilog
+// correct — clock enable
+always @(posedge clk) begin
+    if (clk_enable) begin
+        data_reg <= data_next;
+    end
+    if (rst) data_reg <= {DATA_WIDTH{1'b0}};
+end
+
+// incorrect — gated clock
+assign clk_gated = clk & clk_enable;  // PROHIBITED
+always @(posedge clk_gated) begin ... end
+```
+
+### Resource sharing
+
+**SHOULD** share expensive arithmetic resources (multipliers, dividers) across multiple clock cycles when throughput allows:
+
+```verilog
+// Shared multiplier — time-multiplexed
+reg [OP_SEL_WIDTH-1:0] mul_op_sel_reg = 2'd0;
+reg [DATA_WIDTH-1:0]   mul_result_reg  = {DATA_WIDTH{1'b0}};
+
+always @(posedge clk) begin
+    case (mul_op_sel_reg)
+        2'd0: mul_result_reg <= a * b;
+        2'd1: mul_result_reg <= c * d;
+        default: mul_result_reg <= {DATA_WIDTH{1'b0}};
+    endcase
+    if (rst) begin
+        mul_op_sel_reg <= 2'd0;
+        mul_result_reg <= {DATA_WIDTH{1'b0}};
+    end
+end
+```
+
+---
+
+## 24. Module Partitioning `[BASE]`
+
+### Size thresholds
+
+- **SHOULD** split a module that exceeds ~500 lines into submodules
+- **MUST** extract independent state machines into separate modules
+- **SHOULD** separate datapath from control path when logic is complex
+
+### Reusable submodule patterns
+
+Parameterize and extract common building blocks:
+
+| Building block | Convention | Parameters |
+|---------------|-----------|------------|
+| FIFO | `<name>_fifo` | `DATA_WIDTH`, `DEPTH` |
+| Arbiter | `<name>_arbiter` | `NUM_PORTS`, `PRIORITIES` |
+| Serializer | `<name>_serializer` | `DATA_WIDTH`, `RATIO` |
+| CDC synchronizer | `<name>_sync` | `WIDTH`, `STAGES` |
+| Counter | `<name>_counter` | `WIDTH`, `MODULO` |
+
+### Instantiation of reusable blocks
+
+**MUST** use the `lower_snake_case` naming with `_inst` suffix for instances. Each instantiation follows section 15 rules (named ports, tabular alignment).
+
+---
+
+## 25. AXI Protocol
+
+### AXI-Stream
 
 Applies when an AXI-Stream interface is present:
 
@@ -679,9 +882,62 @@ Applies when an AXI-Stream interface is present:
 - `tdata` **MUST NOT** change while `valid=1` and `ready=0`
 - **MUST NOT** deassert `valid` before `ready` is seen
 
+### AXI4-Lite
+
+Applies when an AXI4-Lite interface is present:
+
+- Each channel (AW, W, B, AR, R) follows independent valid/ready handshake
+- `AWVALID`/`ARVALID` **MUST NOT** depend on `AWREADY`/`ARREADY`
+- `AWREADY`/`ARREADY` **MAY** depend on `AWVALID`/`ARVALID`
+- `BVALID` **MUST** be held until `BREADY` acknowledges — responses must not be dropped
+- **MUST** complete one transaction per handshake (no bursts in AXI4-Lite)
+- `WSTRB` **MUST** be `4'b1111` for 32-bit writes unless byte-level access is explicitly required
+
+```verilog
+// AXI4-Lite write response — correct
+always @* begin
+    bvalid_next = bvalid_reg;
+    // ...
+end
+
+always @(posedge clk) begin
+    bvalid_reg <= bvalid_next;
+    if (rst) bvalid_reg <= 1'b0;
+end
+```
+
+### AXI4-Full
+
+Applies when an AXI4-Full interface is present — inherits all AXI4-Lite rules, plus:
+
+- `WVALID` **MUST NOT** have gaps during a burst — all data beats must be contiguous
+- `WLAST` **MUST** be asserted on the final data beat of a write burst
+- `RLAST` **MUST** be asserted on the final data beat of a read burst
+- `AWLEN` / `ARLEN` define burst length (actual beats = value + 1)
+- `AWSIZE` / `ARSIZE` define beat size in bytes (2^n)
+- **MUST NOT** deassert `AWVALID` or `ARVALID` before `AWREADY` or `ARREADY` is seen
+- **MUST** handle all burst types: FIXED, INCR, WRAP
+- **SHOULD** support narrow transfers (`WSTRB` not all ones) and unaligned addresses
+
+```verilog
+// Write beat counter — correct
+always @* begin
+    wr_count_next = wr_count_reg;
+    wlast         = 1'b0;
+
+    if (wr_count_reg == burst_len) begin
+        wlast = 1'b1;
+    end
+
+    if (wvalid && wready) begin
+        wr_count_next = wr_count_reg + 8'd1;
+    end
+end
+```
+
 ---
 
-## 21. Comments
+## 26. Comments
 
 - Prefer `//` style; `/* */` permitted
 - A comment on its own line describes the code following it
@@ -696,7 +952,7 @@ Applies when an AXI-Stream interface is present:
 
 ---
 
-## 22. Prohibited Constructs
+## 27. Prohibited Constructs
 
 | Construct | Status |
 |-----------|--------|
@@ -714,6 +970,9 @@ Applies when an AXI-Stream interface is present:
 | `output reg` | Prohibited — use `output wire` + internal `_reg` |
 | Explicit sensitivity lists | Prohibited — use `always @*` |
 | Asynchronous / active-low reset (`rst_n`) | Prohibited — use synchronous `rst` |
+| Unsynchronized clock domain crossing | Prohibited — use synchronizer or async FIFO |
+| Gated clocks (`clk & enable`) | Prohibited — use clock-enable pattern |
+| `casex` / `full_case` / `parallel_case` | Prohibited |
 
 ---
 

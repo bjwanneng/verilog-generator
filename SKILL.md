@@ -35,13 +35,26 @@ Generates a single synthesizable Verilog module from natural language or an inte
 - A signal MUST have exactly one driver: either `always` OR `assign`, never both
 
 ### Rule 5: No simulation-only constructs in synthesizable code
-- NEVER use `$display`, `$finish`, `$monitor` outside of testbenches
-- These constructs are only valid in simulation; the generated module must be synthesizable
+- NEVER use `$display`, `$finish`, `$monitor`, `#delay`, or `initial` (except for parameter validation) inside synthesizable modules
+- These constructs are only valid in testbenches; the generated module must be synthesizable
+- **SHOULD** offer to generate a companion testbench (`tb_<module_name>.v`) after the synthesizable module is complete — simulation constructs are expected and required there
 
-### Rule 6: AXI-Stream handshake (applies when AXI-Stream interface is detected)
+### Rule 6: AXI handshake (applies when any AXI interface is detected)
+
+**AXI-Stream:**
 - `valid` MUST be held HIGH until `ready` acknowledges: `if (valid && ready)`
 - `tdata` MUST NOT change while `valid=1` and `ready=0`
 - NEVER deassert `valid` before `ready` is seen
+
+**AXI4-Lite / AXI4-Full:**
+- Each channel (AW, AR, W, R, B) follows independent valid/ready handshake
+- `A[W|R]VALID` MUST NOT depend on `A[W|R]READY` — master must assert valid unconditionally
+- `A[W|R]READY` MAY be dependent on `A[W|R]VALID`
+- `WVALID` MUST NOT have gaps during a burst — all beats must be contiguous
+- `BVALID` MUST be held until `BREADY` — response must not be dropped
+- `RLAST` MUST be asserted on the final beat of a read burst
+- `WLAST` MUST be asserted on the final beat of a write burst
+- NEVER deassert `A[W|R]VALID` before `A[W|R]READY` is seen
 
 ### Rule 7: Self-check before output
 Before outputting the final code block, verify every rule above.
@@ -68,7 +81,7 @@ From the user's input, derive and display:
   ...
 端口:
   input  wire        clk
-  input  wire        rst_n
+  input  wire        rst
   input  wire [W:0]  <signal>
   output wire [W:0]  <signal>
   ...
@@ -129,7 +142,12 @@ endmodule
 [PASS/FAIL] 无前向引用
 [PASS/FAIL] 无多驱动冲突
 [PASS/FAIL] 无占位符
-[PASS/FAIL/N/A] AXI-Stream 握手规则
+[PASS/FAIL] 位宽匹配（所有赋值与端口连接左右宽度一致）
+[PASS/FAIL] 无未使用信号
+[PASS/FAIL] 无锁存器推断（所有 always @* 路径完整赋值）
+[PASS/WARN] 复位覆盖报告（列出未复位的寄存器及原因）
+[PASS/FAIL/N/A] AXI 握手规则（AXI-Stream / AXI4-Lite / AXI4-Full）
+[PASS/FAIL/N/A] 跨时钟域信号已同步（多时钟模块必须）
 [PASS/WARN/N/A] 自定义编码风格已应用
 ````
 
@@ -152,17 +170,18 @@ Key rules from that file:
 |------|------|
 | Module name | `lower_snake_case` |
 | Signal name | `lower_snake_case` |
-| Tunable parameter | `UpperCamelCase` |
-| Localparam constant | `ALL_CAPS` |
+| Parameter / localparam | `ALL_CAPS` |
 | Clock | starts with `clk`; main clock = `clk` |
-| Reset | active-low asynchronous `rst_n` |
+| Reset | synchronous active-high `rst` |
 | Port direction suffixes | `_i` input, `_o` output, `_io` bidir |
-| Register pair suffixes | `_d` next-state, `_q` current-state |
+| Register pair suffixes | `_next` next-state, `_reg` current-state |
+| Pipeline register suffix | `_pipe_reg` |
+| Synchronizer suffix | `_sync` |
 | Active-low suffix | `_n` |
-| Indentation | 2 spaces |
+| Indentation | 4 spaces |
 | Max line length | 100 characters |
-| Sequential block | `always @(posedge clk or negedge rst_n)` |
-| Combinational block | `always @(*)` |
+| Sequential block | `always @(posedge clk)` |
+| Combinational block | `always @*` |
 | Assignments | `<=` in sequential, `=` in combinational |
 | Case | `case` with mandatory `default`; `casez` for wildcards; never `casex` |
 | Port order | clocks → resets → other ports |
@@ -193,3 +212,8 @@ Read the file and infer style from the example. Fills in details not covered by 
 | `Variable declaration in unnamed block requires SystemVerilog` | `reg` inside unnamed `begin...end` | Move declaration to module level |
 | `Multiple drivers on signal 'X'` | Both `always` and `assign` drive X | Pick one driver type and remove the other |
 | AXI `valid` glitch | `valid` cleared before `ready` seen | Use `if (valid && ready) valid <= 1'b0;` |
+| AXI `BVALID` dropped | `bvalid` deasserted before `bready` | Hold `bvalid` until `bready` acknowledgement |
+| AXI `WVALID` gap | Write beat stalled mid-burst | Ensure contiguous `WVALID` assertion during burst |
+| Metastability on crossing | No synchronizer between domains | Insert two-flop synchronizer for control, async FIFO for data |
+| Width mismatch warning | Narrow signal to wide port | Use explicit padding: `{16'd0, sixteen_bit_word}` |
+| Latch inferred for 'X' | Missing assignment in `always @*` path | Add default values at top of combinational block |
